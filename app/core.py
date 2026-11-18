@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Optional
 
@@ -33,17 +34,54 @@ class NoDataError(Exception):
         super().__init__(f"no data for date {date}")
 
 
+class QuarantineNotFoundError(Exception):
+    def __init__(self, record_id: str):
+        self.record_id = record_id
+        super().__init__(f"unknown quarantine record {record_id}")
+
+
+class QuarantineBlockedError(Exception):
+    """The row's user was erased after the row was quarantined; the click
+    must never be written back into the lake."""
+
+    def __init__(self, user_id: str):
+        self.user_id = user_id
+        super().__init__(
+            f"user {user_id!r} is under erasure; the quarantined row was discarded"
+        )
+
+
+def quarantine_dict(rec) -> dict:
+    """Public representation of one quarantine record."""
+    return {
+        "record_id": rec["record_id"],
+        "date": rec["date"],
+        "line_no": rec["line_no"],
+        "user_id": rec["user_id"],
+        "page": rec["page"],
+        "raw_timestamp": rec["raw_timestamp"],
+        "raw_line": rec["raw_line"],
+        "status": rec["status"],
+        "created_at": rec["created_at"],
+        "repaired_at": rec["repaired_at"],
+        "repaired_ts": rec["repaired_ts"],
+        "file_id": rec["file_id"],
+    }
+
+
 class ErasureService:
     """Core of the click lake: ingest, download and GDPR-style erasure.
 
     Concurrency model
     -----------------
-    * ``commit_lock`` serializes upload commits against erasure acceptance.
-      An upload filters blocked users, writes its part file and commits the
-      DB record while holding the lock; accepting an erasure takes the same
-      lock. Therefore a file that contains an erased user can never be
-      committed after the erasure was accepted, and every file committed
-      before is part of the erasure snapshot.
+    * ``commit_lock`` serializes upload commits, quarantine repairs and
+      erasure acceptance. An upload filters blocked users, writes its part
+      file and commits the DB record while holding the lock; a repair checks
+      its quarantine record, writes the corrected click and registers it
+      under the same lock; accepting an erasure takes the same lock.
+      Therefore a file that contains an erased user can never be committed
+      after the erasure was accepted, and every file committed before is
+      part of the erasure snapshot.
     * A single background worker rewrites files sequentially, which makes
       overlapping erasures of the same files safe.
     * Per-date locks let an in-progress download finish with a consistent
@@ -98,12 +136,16 @@ class ErasureService:
 
     # -------------------------------------------------------------- uploads
 
-    def upload(self, date: str, table: pa.Table) -> dict:
-        """Append the rows of one CSV as a new part file for ``date``.
+    def upload(self, date: str, table: pa.Table, quarantine_rows: list[dict]) -> dict:
+        """Append the rows of one CSV as a new part file for ``date`` and
+        register the quarantined bad rows alongside it.
 
         Rows belonging to blocked users are dropped at commit time, so even an
         upload that started before an erasure request was accepted can never
-        write that user's data back.
+        write that user's data back; their bad rows are not quarantined either
+        (they could never be repaired). The part file and the quarantine
+        records are registered in a single transaction, so a failure leaves
+        no orphaned records behind.
         """
         with self.commit_lock:
             if self.hooks.before_write is not None:
@@ -122,16 +164,28 @@ class ErasureService:
                 filtered = table
             blocked = received - filtered.num_rows
             file_id = None
+            rel_path = None
+            users: set[str] = set()
             if filtered.num_rows:
                 file_id, rel_path = storage.write_table_atomic(
                     self.config.data_dir, date, filtered
                 )
                 users = set(filtered.column("user_id").to_pylist())
-                self.store.record_upload(file_id, date, rel_path, filtered.num_rows, users)
+            records = [
+                {"record_id": new_file_id(), "date": date, **row}
+                for row in quarantine_rows
+                if row["user_id"] not in blocked_set
+            ]
+            if file_id is not None or records:
+                self.store.record_upload(
+                    file_id, date, rel_path, filtered.num_rows, users, records
+                )
             return {
                 "blocked": blocked,
                 "stored": filtered.num_rows,
                 "file_id": file_id,
+                "quarantined": len(records),
+                "quarantine_ids": [r["record_id"] for r in records],
             }
 
     # ------------------------------------------------------------ downloads
@@ -153,6 +207,71 @@ class ErasureService:
                 raise NoDataError(date)
             tables = [storage.read_table(self.config.data_dir, f["path"]) for f in files]
         return pa.concat_tables(tables) if len(tables) > 1 else tables[0]
+
+    # ------------------------------------------------------------ quarantine
+
+    def get_quarantine(self, record_id: str) -> Optional[dict]:
+        rec = self.store.get_quarantine(record_id)
+        return quarantine_dict(rec) if rec is not None else None
+
+    def list_quarantine(self, user_id: Optional[str] = None,
+                        status: Optional[str] = None) -> list[dict]:
+        return [
+            quarantine_dict(rec)
+            for rec in self.store.list_quarantine(user_id=user_id, status=status)
+        ]
+
+    def repair_quarantine(self, record_id: str, ts: datetime) -> dict:
+        """Write the quarantined click, with its corrected timestamp, into the
+        original upload date's partition and mark the record repaired.
+
+        The check → write → register sequence runs under the commit lock and
+        the registration is one transaction, which gives the repair its
+        exactly-once semantics:
+
+        * if the write or the registration fails, the record stays pending
+          (a half-written file is reconciled away at startup) and the repair
+          can simply be retried;
+        * once repaired, any replay — a concurrent request, a client retry
+          after a lost response, or a retry after a restart — returns the
+          recorded outcome without writing the click a second time;
+        * if the user was erased in the meantime, the record is already gone
+          (erasure acceptance deletes it) or is discarded here without
+          writing anything back.
+        """
+        with self.commit_lock:
+            rec = self.store.get_quarantine(record_id)
+            if rec is None:
+                raise QuarantineNotFoundError(record_id)
+            if rec["status"] == "repaired":
+                # idempotent replay: the click is already in the lake
+                return quarantine_dict(rec)
+            if rec["user_id"] in self.blocked_users:
+                self.store.delete_quarantine(record_id)
+                raise QuarantineBlockedError(rec["user_id"])
+            table = pa.table(
+                {
+                    "user_id": [rec["user_id"]],
+                    "page": [rec["page"]],
+                    "ts": [ts],
+                },
+                schema=storage.SCHEMA,
+            )
+            file_id, rel_path = storage.write_table_atomic(
+                self.config.data_dir, rec["date"], table
+            )
+            self.store.record_repair(
+                record_id,
+                file_id,
+                rec["date"],
+                rel_path,
+                rec["user_id"],
+                ts.astimezone(timezone.utc).isoformat(),
+            )
+            log.info(
+                "quarantine record %s repaired into %s", record_id, rel_path
+            )
+            return quarantine_dict(self.store.get_quarantine(record_id))
 
     # -------------------------------------------------------------- erasure
 

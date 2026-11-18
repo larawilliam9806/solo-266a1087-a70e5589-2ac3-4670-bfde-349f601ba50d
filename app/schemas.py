@@ -5,3 +5,9 @@ from pydantic import BaseModel, Field
 
 class ErasureRequest(BaseModel):
     user_id: str = Field(min_length=1, max_length=512)
+
+
+class RepairRequest(BaseModel):
+    """Corrected timestamp for a quarantined row."""
+
+    timestamp: str = Field(min_length=1, max_length=128)

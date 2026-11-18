@@ -4,6 +4,7 @@ import csv
 import io
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -76,6 +77,18 @@ def download_users(client: TestClient, date: str) -> set[str]:
     assert r.status_code == 200, r.text
     rows = list(csv.reader(io.StringIO(r.text)))
     return {row[0] for row in rows[1:]}
+
+
+def download_rows(client: TestClient, date: str) -> list[list[str]]:
+    r = client.get(f"/dates/{date}/download")
+    assert r.status_code == 200, r.text
+    return list(csv.reader(io.StringIO(r.text)))[1:]
+
+
+def upload_ok(client: TestClient, date: str, rows) -> dict:
+    r = upload(client, date, rows)
+    assert r.status_code == 200, r.text
+    return r.json()
 
 
 # ------------------------------------------------------------------- tests
@@ -469,3 +482,379 @@ def test_progress_endpoint_reports_counts(tmp_path):
         assert status["restricted_dates"] == []
         assert status["last_error"] is None
         assert client.get("/erasure/does-not-exist").status_code == 404
+
+
+# ------------------------------------------------------- quarantine / repair
+
+
+def test_quarantined_rows_are_saved_and_queryable(tmp_path):
+    with make_client(tmp_path) as client:
+        body = upload_ok(
+            client,
+            "2026-11-01",
+            [
+                ("alice", "/home", "not-a-time"),
+                ("bob", "/pricing", "2026-11-01T10:05:00Z"),
+                ("carol", "/about", "also-bad"),
+            ],
+        )
+        # quarantined rows still count as invalid; valid rows are stored
+        assert body["received"] == 3
+        assert body["invalid"] == 2
+        assert body["stored"] == 1
+        assert body["quarantined"] == 2
+        ids = body["quarantine_ids"]
+        assert len(ids) == 2
+
+        rec = client.get(f"/quarantine/{ids[0]}").json()
+        assert rec["user_id"] == "alice"
+        assert rec["page"] == "/home"
+        assert rec["date"] == "2026-11-01"
+        assert rec["line_no"] == 2  # header is line 1
+        assert rec["raw_timestamp"] == "not-a-time"
+        assert rec["raw_line"] == "alice,/home,not-a-time"
+        assert rec["status"] == "pending"
+        assert rec["repaired_at"] is None
+        assert client.get(f"/quarantine/{ids[1]}").json()["line_no"] == 4
+
+        # list endpoint and filters
+        all_recs = client.get("/quarantine").json()
+        assert {r["record_id"] for r in all_recs} == set(ids)
+        by_user = client.get("/quarantine", params={"user_id": "carol"}).json()
+        assert [r["record_id"] for r in by_user] == [ids[1]]
+        assert len(client.get("/quarantine", params={"status": "pending"}).json()) == 2
+        assert client.get("/quarantine", params={"status": "repaired"}).json() == []
+
+        assert client.get("/quarantine/does-not-exist").status_code == 404
+
+
+def test_other_invalid_rows_are_not_quarantined(tmp_path):
+    with make_client(tmp_path) as client:
+        r = client.post(
+            "/upload/2026-11-01",
+            files={
+                "file": (
+                    "x.csv",
+                    b"user_id,page,timestamp\n"
+                    b",/a,2026-11-01T00:00:00Z\n"  # empty user_id
+                    b"alice\n"  # missing columns
+                    b"bob,/b,2026-11-01T00:00:00Z\n",
+                    "text/csv",
+                )
+            },
+        )
+        body = r.json()
+        assert body["received"] == 3
+        assert body["invalid"] == 2
+        assert body["stored"] == 1
+        assert body["quarantined"] == 0
+        assert body["quarantine_ids"] == []
+        assert client.get("/quarantine").json() == []
+
+
+def test_quarantine_line_numbers_match_the_file(tmp_path):
+    with make_client(tmp_path) as client:
+        r = client.post(
+            "/upload/2026-11-01",
+            files={
+                "file": (
+                    "x.csv",
+                    b"user_id,page,timestamp\n\nalice,/a,bad-ts\n",
+                    "text/csv",
+                )
+            },
+        )
+        body = r.json()
+        assert body["quarantined"] == 1
+        rec = client.get(f"/quarantine/{body['quarantine_ids'][0]}").json()
+        assert rec["line_no"] == 3
+
+
+def test_repair_writes_click_into_original_date(tmp_path):
+    with make_client(tmp_path) as client:
+        body = upload_ok(client, "2026-11-01", [("alice", "/home", "not-a-time")])
+        rec_id = body["quarantine_ids"][0]
+        assert body["stored"] == 0
+        assert body["file_id"] is None
+        assert client.get("/dates/2026-11-01/download").status_code == 404
+
+        r = client.post(
+            f"/quarantine/{rec_id}/repair",
+            json={"timestamp": "2026-11-01T10:30:00Z"},
+        )
+        assert r.status_code == 200, r.text
+        repaired = r.json()
+        assert repaired["status"] == "repaired"
+        assert repaired["repaired_ts"] == "2026-11-01T10:30:00+00:00"
+        assert repaired["file_id"]
+
+        # the click is served from the original upload date
+        assert download_rows(client, "2026-11-01") == [
+            ["alice", "/home", "2026-11-01T10:30:00+00:00"]
+        ]
+        assert client.get("/dates").json() == [
+            {"date": "2026-11-01", "files": 1, "rows": 1, "restricted": False}
+        ]
+
+        # replaying the repair (e.g. after a lost response) must not duplicate
+        r = client.post(
+            f"/quarantine/{rec_id}/repair",
+            json={"timestamp": "2026-11-01T10:30:00Z"},
+        )
+        assert r.status_code == 200
+        assert r.json()["file_id"] == repaired["file_id"]
+        assert download_rows(client, "2026-11-01") == [
+            ["alice", "/home", "2026-11-01T10:30:00+00:00"]
+        ]
+
+
+def test_repair_rejects_invalid_timestamp_and_unknown_record(tmp_path):
+    with make_client(tmp_path) as client:
+        body = upload_ok(client, "2026-11-01", [("alice", "/home", "not-a-time")])
+        rec_id = body["quarantine_ids"][0]
+
+        r = client.post(f"/quarantine/{rec_id}/repair", json={"timestamp": "junk"})
+        assert r.status_code == 422
+        # the row stays pending and nothing was written
+        assert client.get(f"/quarantine/{rec_id}").json()["status"] == "pending"
+        assert client.get("/dates/2026-11-01/download").status_code == 404
+
+        r = client.post(
+            "/quarantine/nope/repair", json={"timestamp": "2026-11-01T00:00:00Z"}
+        )
+        assert r.status_code == 404
+
+
+def test_upload_registers_valid_rows_and_quarantine_atomically(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    app1 = create_app(config)
+    with TestClient(app1) as client:
+        service = client.app.state.service
+
+        def boom(*args, **kwargs):
+            raise OSError("db unavailable")
+
+        monkeypatch.setattr(service.store, "record_upload", boom)
+        with pytest.raises(OSError):
+            upload(
+                client,
+                "2026-11-01",
+                [("alice", "/a", "2026-11-01T00:00:00Z"), ("bob", "/b", "bad-ts")],
+            )
+        # neither the valid rows nor the quarantine records were registered
+        assert client.get("/dates").json() == []
+        assert client.get("/quarantine").json() == []
+
+    # restart: the orphaned part file is reconciled away, nothing lingers
+    app2 = create_app(config)
+    with TestClient(app2) as client2:
+        assert list((tmp_path / "data").rglob("part-*.parquet")) == []
+        assert client2.get("/quarantine").json() == []
+
+
+def test_concurrent_repairs_never_duplicate(tmp_path):
+    with make_client(tmp_path) as client:
+        body = upload_ok(client, "2026-11-01", [("alice", "/a", "bad-ts")])
+        rec_id = body["quarantine_ids"][0]
+        service = client.app.state.service
+        ts = datetime(2026, 11, 1, 10, 0, tzinfo=timezone.utc)
+
+        results, errors = [], []
+
+        def repair():
+            try:
+                results.append(service.repair_quarantine(rec_id, ts))
+            except Exception as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+
+        threads = [threading.Thread(target=repair) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors
+        assert len(results) == 8
+        # every caller observes the same single repair
+        assert {r["file_id"] for r in results} == {results[0]["file_id"]}
+        assert download_rows(client, "2026-11-01") == [
+            ["alice", "/a", "2026-11-01T10:00:00+00:00"]
+        ]
+        assert len(list((tmp_path / "data").rglob("part-*.parquet"))) == 1
+
+
+def test_failed_repair_keeps_record_pending_and_retry_writes_once(tmp_path, monkeypatch):
+    with make_client(tmp_path) as client:
+        body = upload_ok(client, "2026-11-01", [("alice", "/a", "bad-ts")])
+        rec_id = body["quarantine_ids"][0]
+
+        real_write = storage.write_table_atomic
+        calls = {"n": 0}
+
+        def fail_once(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("simulated disk failure")
+            return real_write(*args, **kwargs)
+
+        monkeypatch.setattr(storage, "write_table_atomic", fail_once)
+        with pytest.raises(OSError):
+            client.post(
+                f"/quarantine/{rec_id}/repair",
+                json={"timestamp": "2026-11-01T10:00:00Z"},
+            )
+        # the pending row survives the failed repair
+        assert client.get(f"/quarantine/{rec_id}").json()["status"] == "pending"
+
+        r = client.post(
+            f"/quarantine/{rec_id}/repair",
+            json={"timestamp": "2026-11-01T10:00:00Z"},
+        )
+        assert r.status_code == 200
+        assert download_rows(client, "2026-11-01") == [
+            ["alice", "/a", "2026-11-01T10:00:00+00:00"]
+        ]
+
+
+def test_repair_registration_failure_leaves_no_orphan_after_restart(
+    tmp_path, monkeypatch
+):
+    config = make_config(tmp_path)
+    app1 = create_app(config)
+    with TestClient(app1) as client:
+        body = upload_ok(client, "2026-11-01", [("alice", "/a", "bad-ts")])
+        rec_id = body["quarantine_ids"][0]
+        service = client.app.state.service
+
+        def boom(*args, **kwargs):
+            raise OSError("db unavailable")
+
+        monkeypatch.setattr(service.store, "record_repair", boom)
+        with pytest.raises(OSError):
+            client.post(
+                f"/quarantine/{rec_id}/repair",
+                json={"timestamp": "2026-11-01T10:00:00Z"},
+            )
+        # record kept pending; the unregistered file is not part of the lake
+        assert client.get(f"/quarantine/{rec_id}").json()["status"] == "pending"
+        assert client.get("/dates/2026-11-01/download").status_code == 404
+        assert len(list((tmp_path / "data").rglob("part-*.parquet"))) == 1
+
+    # restart: recovery removes the orphaned file; the retry writes exactly once
+    app2 = create_app(config)
+    with TestClient(app2) as client2:
+        assert list((tmp_path / "data").rglob("part-*.parquet")) == []
+        r = client2.post(
+            f"/quarantine/{rec_id}/repair",
+            json={"timestamp": "2026-11-01T10:00:00Z"},
+        )
+        assert r.status_code == 200
+        assert download_rows(client2, "2026-11-01") == [
+            ["alice", "/a", "2026-11-01T10:00:00+00:00"]
+        ]
+        assert len(list((tmp_path / "data").rglob("part-*.parquet"))) == 1
+
+
+def test_erasure_deletes_quarantine_records_and_blocks_repair(tmp_path):
+    with make_client(tmp_path) as client:
+        body = upload_ok(
+            client,
+            "2026-11-01",
+            [("alice", "/a", "bad-ts"), ("bob", "/b", "also-bad")],
+        )
+        alice_rec, bob_rec = body["quarantine_ids"]
+
+        task_id = client.post("/erasure", json={"user_id": "alice"}).json()["task_id"]
+        wait_task(client, task_id)
+
+        # alice's quarantined rows are gone and cannot be repaired anymore
+        assert client.get(f"/quarantine/{alice_rec}").status_code == 404
+        r = client.post(
+            f"/quarantine/{alice_rec}/repair",
+            json={"timestamp": "2026-11-01T10:00:00Z"},
+        )
+        assert r.status_code == 404
+
+        # other users' rows are unaffected and still repairable
+        r = client.post(
+            f"/quarantine/{bob_rec}/repair",
+            json={"timestamp": "2026-11-01T10:05:00Z"},
+        )
+        assert r.status_code == 200
+        assert download_users(client, "2026-11-01") == {"bob"}
+
+
+def test_bad_rows_of_blocked_users_are_not_quarantined(tmp_path):
+    with make_client(tmp_path) as client:
+        task_id = client.post("/erasure", json={"user_id": "alice"}).json()["task_id"]
+        wait_task(client, task_id)
+
+        body = upload_ok(
+            client,
+            "2026-11-01",
+            [("alice", "/a", "bad-ts"), ("bob", "/b", "2026-11-01T00:00:00Z")],
+        )
+        assert body["invalid"] == 1  # alice's row still counts as invalid
+        assert body["quarantined"] == 0  # but can never be quarantined/repaired
+        assert body["stored"] == 1
+        assert client.get("/quarantine").json() == []
+
+
+def test_repaired_click_is_covered_by_future_erasure(tmp_path):
+    with make_client(tmp_path) as client:
+        body = upload_ok(
+            client,
+            "2026-11-01",
+            [("carol", "/c", "bad-ts"), ("dave", "/d", "2026-11-01T00:00:00Z")],
+        )
+        rec_id = body["quarantine_ids"][0]
+        r = client.post(
+            f"/quarantine/{rec_id}/repair",
+            json={"timestamp": "2026-11-01T09:00:00Z"},
+        )
+        assert r.status_code == 200
+        assert download_users(client, "2026-11-01") == {"carol", "dave"}
+
+        task_id = client.post("/erasure", json={"user_id": "carol"}).json()["task_id"]
+        wait_task(client, task_id)
+        # the repaired click is part of the lake and gets erased like any other
+        assert download_users(client, "2026-11-01") == {"dave"}
+        assert client.get(f"/quarantine/{rec_id}").status_code == 404
+
+
+def test_repair_during_restriction_visible_once_download_resumes(tmp_path):
+    with make_client(tmp_path) as client:
+        body = upload_ok(
+            client,
+            "2026-11-01",
+            [("alice", "/a", "2026-11-01T00:00:00Z"), ("carol", "/c", "bad-ts")],
+        )
+        rec_id = body["quarantine_ids"][0]
+
+        service = client.app.state.service
+        gate = threading.Event()
+        original_erase = service.erase_file
+
+        def slow_erase(task, file_id):
+            gate.wait(10)
+            return original_erase(task, file_id)
+
+        service.erase_file = slow_erase
+        try:
+            task_id = client.post("/erasure", json={"user_id": "alice"}).json()[
+                "task_id"
+            ]
+            # the date is restricted: downloads pause, but the repair still lands
+            assert client.get("/dates/2026-11-01/download").status_code == 409
+            r = client.post(
+                f"/quarantine/{rec_id}/repair",
+                json={"timestamp": "2026-11-01T09:00:00Z"},
+            )
+            assert r.status_code == 200
+        finally:
+            gate.set()
+            service.erase_file = original_erase
+
+        wait_task(client, task_id)
+        # once the date is downloadable again, the repaired click is visible
+        assert download_users(client, "2026-11-01") == {"carol"}

@@ -49,6 +49,24 @@ CREATE TABLE IF NOT EXISTS restricted_dates (
     task_id TEXT NOT NULL,
     PRIMARY KEY (date, task_id)
 );
+
+-- uploaded rows whose user_id was present but whose timestamp could not be
+-- parsed; kept out of the lake until a corrected timestamp is submitted
+CREATE TABLE IF NOT EXISTS quarantine_records (
+    record_id     TEXT PRIMARY KEY,
+    date          TEXT NOT NULL,          -- the upload's target date
+    line_no       INTEGER NOT NULL,       -- 1-based line number in the CSV file
+    user_id       TEXT NOT NULL,
+    page          TEXT NOT NULL,
+    raw_timestamp TEXT NOT NULL,          -- the timestamp text that failed to parse
+    raw_line      TEXT NOT NULL,          -- the row's original content
+    status        TEXT NOT NULL CHECK (status IN ('pending', 'repaired')),
+    created_at    TEXT NOT NULL,
+    repaired_at   TEXT,
+    repaired_ts   TEXT,                   -- the corrected timestamp that was applied
+    file_id       TEXT                    -- the part file the repaired click landed in
+);
+CREATE INDEX IF NOT EXISTS idx_quarantine_user ON quarantine_records(user_id, status);
 """
 
 
@@ -101,18 +119,43 @@ class StateStore:
 
     # ---------------------------------------------------------------- files
 
-    def record_upload(self, file_id: str, date: str, path: str, rows: int,
-                      user_ids: Iterable[str]) -> None:
+    def record_upload(self, file_id: Optional[str], date: str, path: Optional[str],
+                      rows: int, user_ids: Iterable[str],
+                      quarantine: Iterable[dict] = ()) -> None:
+        """Register one upload atomically: the part file, the user/date index
+        and the quarantined bad rows commit together or not at all, so a
+        failure can never leave one half of the upload registered without
+        the other. ``file_id``/``path`` are None when the upload had no
+        valid rows to store."""
         now = utcnow()
         with self.transaction() as conn:
-            conn.execute(
-                "INSERT INTO files(file_id, date, path, rows, status, created_at)"
-                " VALUES (?,?,?,?,'active',?)",
-                (file_id, date, path, rows, now),
-            )
+            if file_id is not None:
+                conn.execute(
+                    "INSERT INTO files(file_id, date, path, rows, status, created_at)"
+                    " VALUES (?,?,?,?,'active',?)",
+                    (file_id, date, path, rows, now),
+                )
             conn.executemany(
                 "INSERT OR IGNORE INTO user_dates(user_id, date) VALUES (?,?)",
                 [(u, date) for u in user_ids],
+            )
+            conn.executemany(
+                "INSERT INTO quarantine_records(record_id, date, line_no, user_id,"
+                " page, raw_timestamp, raw_line, status, created_at)"
+                " VALUES (?,?,?,?,?,?,?,'pending',?)",
+                [
+                    (
+                        q["record_id"],
+                        q["date"],
+                        q["line_no"],
+                        q["user_id"],
+                        q["page"],
+                        q["raw_timestamp"],
+                        q["raw_line"],
+                        now,
+                    )
+                    for q in quarantine
+                ],
             )
 
     def get_file(self, file_id: str) -> Optional[sqlite3.Row]:
@@ -148,8 +191,11 @@ class StateStore:
 
     def accept_task(self, task_id: str, user_id: str) -> None:
         """Create the task, snapshot every active file that may hold the user's
-        data and restrict the affected dates — atomically. Runs under the
-        service commit lock, so no upload can slip in between."""
+        data, restrict the affected dates and drop the user's quarantined
+        rows — atomically. Runs under the service commit lock, so no upload
+        or repair can slip in between. Deleting the quarantine records here
+        is what keeps an in-flight repair from writing the erased user's
+        click back afterwards."""
         now = utcnow()
         with self.transaction() as conn:
             conn.execute(
@@ -169,6 +215,7 @@ class StateStore:
                 " SELECT date, ? FROM user_dates WHERE user_id=?",
                 (task_id, user_id),
             )
+            conn.execute("DELETE FROM quarantine_records WHERE user_id=?", (user_id,))
 
     def get_task(self, task_id: str) -> Optional[sqlite3.Row]:
         return self.query_one("SELECT * FROM erasure_tasks WHERE task_id=?", (task_id,))
@@ -266,6 +313,57 @@ class StateStore:
             conn.execute("UPDATE files SET status='obsolete' WHERE file_id=?", (old_file_id,))
             conn.execute(
                 "UPDATE erasure_files SET status='done' WHERE file_id=?", (old_file_id,)
+            )
+
+    # ------------------------------------------------------- quarantine rows
+
+    def get_quarantine(self, record_id: str) -> Optional[sqlite3.Row]:
+        return self.query_one(
+            "SELECT * FROM quarantine_records WHERE record_id=?", (record_id,)
+        )
+
+    def list_quarantine(self, user_id: Optional[str] = None,
+                        status: Optional[str] = None) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM quarantine_records"
+        clauses, params = [], []
+        if user_id is not None:
+            clauses.append("user_id=?")
+            params.append(user_id)
+        if status is not None:
+            clauses.append("status=?")
+            params.append(status)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at, record_id"
+        return self.query(sql, tuple(params))
+
+    def record_repair(self, record_id: str, file_id: str, date: str, path: str,
+                      user_id: str, ts_iso: str) -> None:
+        """Atomically register the repair's part file, the user's date index
+        and the record's repaired state. A crash before this commits leaves
+        the record pending (the half-written file is reconciled away at
+        startup), so a retry can never register the click twice."""
+        now = utcnow()
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT INTO files(file_id, date, path, rows, status, created_at)"
+                " VALUES (?,?,?,1,'active',?)",
+                (file_id, date, path, now),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO user_dates(user_id, date) VALUES (?,?)",
+                (user_id, date),
+            )
+            conn.execute(
+                "UPDATE quarantine_records SET status='repaired', repaired_at=?,"
+                " repaired_ts=?, file_id=? WHERE record_id=? AND status='pending'",
+                (now, ts_iso, file_id, record_id),
+            )
+
+    def delete_quarantine(self, record_id: str) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "DELETE FROM quarantine_records WHERE record_id=?", (record_id,)
             )
 
     # ----------------------------------------------- user dates / restrictions

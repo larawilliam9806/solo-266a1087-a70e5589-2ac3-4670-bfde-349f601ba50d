@@ -13,8 +13,14 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse, Response
 
 from .config import Config
-from .core import ErasureService, NoDataError, RestrictedError
-from .schemas import ErasureRequest
+from .core import (
+    ErasureService,
+    NoDataError,
+    QuarantineBlockedError,
+    QuarantineNotFoundError,
+    RestrictedError,
+)
+from .schemas import ErasureRequest, RepairRequest
 from .storage import SCHEMA
 
 log = logging.getLogger("erasure.api")
@@ -23,7 +29,10 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def parse_timestamp(raw: str) -> datetime:
-    """Parse an ISO-8601 timestamp (or epoch seconds) and normalize to UTC."""
+    """Parse an ISO-8601 timestamp (or epoch seconds) and normalize to UTC.
+
+    Raises ``ValueError`` for anything that cannot be interpreted.
+    """
     s = raw.strip()
     if not s:
         raise ValueError("empty timestamp")
@@ -32,27 +41,38 @@ def parse_timestamp(raw: str) -> datetime:
     try:
         dt = datetime.fromisoformat(s)
     except ValueError:
-        dt = datetime.fromtimestamp(float(s), tz=timezone.utc)
+        try:
+            dt = datetime.fromtimestamp(float(s), tz=timezone.utc)
+        except (ValueError, OverflowError, OSError) as exc:
+            raise ValueError(f"cannot parse timestamp {raw!r}") from exc
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
 
-def parse_csv(raw: bytes) -> tuple[pa.Table, int, int]:
+def parse_csv(raw: bytes) -> tuple[pa.Table, int, int, list[dict]]:
     """Parse an uploaded CSV into the canonical schema.
 
-    Returns ``(table, received, invalid)`` where ``received`` counts all data
-    rows and ``invalid`` the rows that had to be skipped.
+    Returns ``(table, received, invalid, quarantine)`` where ``received``
+    counts all data rows and ``invalid`` the rows that had to be skipped.
+    Rows that have a user_id but an unparseable timestamp are additionally
+    returned in ``quarantine`` (with their line number and original content)
+    so they can be repaired later; every other malformed row is just
+    counted and skipped.
     """
     try:
         text = raw.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise HTTPException(400, f"CSV must be UTF-8 encoded: {exc}")
     reader = csv.reader(io.StringIO(text))
-    rows = [r for r in reader if any(cell.strip() for cell in r)]
+    rows = [
+        (line_no, r)
+        for line_no, r in enumerate(reader, start=1)
+        if any(cell.strip() for cell in r)
+    ]
     if not rows:
         raise HTTPException(400, "empty CSV")
-    header = [h.strip().lower() for h in rows[0]]
+    header = [h.strip().lower() for h in rows[0][1]]
     try:
         iu = header.index("user_id")
         ip = header.index("page")
@@ -62,16 +82,34 @@ def parse_csv(raw: bytes) -> tuple[pa.Table, int, int]:
             400, "CSV header must contain columns: user_id, page, timestamp"
         )
     users, pages, stamps = [], [], []
+    quarantine: list[dict] = []
     invalid = 0
-    for r in rows[1:]:
+    for line_no, r in rows[1:]:
         try:
             user = r[iu].strip()
             if not user:
                 raise ValueError("empty user_id")
             page = r[ip]
-            ts = parse_timestamp(r[it])
         except (ValueError, IndexError):
             invalid += 1
+            continue
+        raw_ts = r[it] if it < len(r) else ""
+        try:
+            ts = parse_timestamp(raw_ts)
+        except ValueError:
+            # user_id present but timestamp unusable: quarantine the raw row
+            invalid += 1
+            buf = io.StringIO()
+            csv.writer(buf, lineterminator="").writerow(r)
+            quarantine.append(
+                {
+                    "line_no": line_no,
+                    "user_id": user,
+                    "page": page,
+                    "raw_timestamp": raw_ts,
+                    "raw_line": buf.getvalue(),
+                }
+            )
             continue
         users.append(user)
         pages.append(page)
@@ -80,7 +118,7 @@ def parse_csv(raw: bytes) -> tuple[pa.Table, int, int]:
         {"user_id": users, "page": pages, "ts": stamps},
         schema=SCHEMA,
     )
-    return table, len(users) + invalid, invalid
+    return table, len(users) + invalid, invalid, quarantine
 
 
 def validate_date(date: str) -> str:
@@ -122,8 +160,8 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.post("/upload/{date}", summary="Append a CSV of clicks for one day")
     def upload(date: str, file: UploadFile = File(...)):
         date = validate_date(date)
-        table, received, invalid = parse_csv(file.file.read())
-        result = service.upload(date, table)
+        table, received, invalid, quarantine_rows = parse_csv(file.file.read())
+        result = service.upload(date, table, quarantine_rows)
         return {"date": date, "received": received, "invalid": invalid, **result}
 
     # ------------------------------------------------------------ download
@@ -169,6 +207,38 @@ def create_app(config: Config | None = None) -> FastAPI:
             media_type="text/csv",
             headers={"Content-Disposition": f'attachment; filename="clicks-{date}.csv"'},
         )
+
+    # ----------------------------------------------------------- quarantine
+
+    @app.get("/quarantine", summary="List quarantined bad rows")
+    def list_quarantine(
+        user_id: str | None = None,
+        status: str | None = Query(None, pattern="^(pending|repaired)$"),
+    ):
+        return service.list_quarantine(user_id=user_id, status=status)
+
+    @app.get("/quarantine/{record_id}", summary="Inspect one quarantined row")
+    def get_quarantine(record_id: str):
+        rec = service.get_quarantine(record_id)
+        if rec is None:
+            raise HTTPException(404, f"unknown quarantine record {record_id}")
+        return rec
+
+    @app.post(
+        "/quarantine/{record_id}/repair",
+        summary="Submit a corrected timestamp for a quarantined row",
+    )
+    def repair_quarantine(record_id: str, req: RepairRequest):
+        try:
+            ts = parse_timestamp(req.timestamp)
+        except ValueError:
+            raise HTTPException(422, f"invalid timestamp {req.timestamp!r}")
+        try:
+            return service.repair_quarantine(record_id, ts)
+        except QuarantineNotFoundError as exc:
+            raise HTTPException(404, str(exc))
+        except QuarantineBlockedError as exc:
+            raise HTTPException(409, str(exc))
 
     # ------------------------------------------------------------- erasure
 
